@@ -9,9 +9,13 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@qdrant/js-client-rest": "^1.20.0",
     "next": "16.4.3",
+    "openai": "^7.46.0",
+    "pdfjs-dist": "^6.4.299",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "word-extractor": "^1.0.4"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",
