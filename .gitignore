@@ -23,6 +23,8 @@
 # misc
 .DS_Store
 *.pem
+/lastest
+/lastest.pub
 
 # debug
 npm-debug.log*
@@ -40,3 +42,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local RAG evaluation reports
+/evals/results/

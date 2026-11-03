@@ -1,0 +1,7 @@
+QuizNest evaluation sample employee guide. This is synthetic fixture data, not a real company policy.
+
+The standard remote work allowance is three days per week.
+
+For an incident that interrupts a customer-facing service, notify the on-call manager within 30 minutes after confirming the disruption.
+
+This sample guide does not specify an annual hardware budget.

@@ -17,5 +17,16 @@ export type VectorHealth = {
   qdrantConfigured: boolean;
   qdrantConnected: boolean;
   embeddingConfigured: boolean;
+  ragMode: "offline" | "online";
+  modeConfigured: boolean;
+  providerName: string;
+  embeddingModel: string;
+  answerModel: string;
+  vectorSize: number | null;
+  indexedVectorSize: number | null;
+  vectorDimensionsMatch: boolean | null;
+  indexMessage: string | null;
+  providerConnected: boolean;
+  providerMessage: string | null;
   ready: boolean;
 };

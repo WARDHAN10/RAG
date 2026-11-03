@@ -1,14 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { DocumentTextExtractionError, extractDocumentText } from "@/lib/extract-text";
 import { embedTexts } from "@/lib/embeddings";
+import { EMBEDDING_USD_PER_MILLION_TOKENS } from "@/lib/openai-pricing";
 import type { StoredDocument } from "@/lib/document-types";
 import { chunkText } from "@/lib/chunk-text";
-import { ensureCollection, getCollectionName, getQdrantClient, isQdrantConfigured } from "@/lib/qdrant";
+import { createChunkId } from "@/lib/rag-core";
+import { collectionExists, ensureCollection, getCollectionName, getQdrantClient, isQdrantConfigured } from "@/lib/qdrant";
+import { getRagMode, getRagProviderConfigurationMessage, isRagProviderConfigured } from "@/lib/rag-config";
+import { handleResetRequest } from "@/lib/reset-handler";
 
 const MAX_FILE_SIZE = 2 * 1024 * 1024;
 const MAX_CHUNKS = 2500;
 const EMBEDDING_BATCH_SIZE = 128;
-const EMBEDDING_USD_PER_MILLION_TOKENS = 0.02;
 
 type ChunkPayload = {
   documentId?: unknown;
@@ -117,12 +120,27 @@ export async function GET() {
   }
 }
 
+export async function DELETE(request: Request) {
+  if (!isQdrantConfigured()) {
+    return jsonError("Qdrant is not configured. Copy .env.example to .env.local.", 503);
+  }
+
+  return handleResetRequest(request, async () => {
+    const client = getQdrantClient();
+    const collectionName = getCollectionName();
+    if (await collectionExists()) {
+      await client.deleteCollection(collectionName);
+    }
+    await ensureCollection();
+  });
+}
+
 export async function POST(request: Request) {
   if (!isQdrantConfigured()) {
     return jsonError("Qdrant is not configured. Copy .env.example to .env.local.", 503);
   }
-  if (!process.env.OPENAI_API_KEY?.trim()) {
-    return jsonError("OPENAI_API_KEY is missing. Add it to .env.local to create embeddings.", 503);
+  if (!isRagProviderConfigured()) {
+    return jsonError(getRagProviderConfigurationMessage(), 503);
   }
 
   let formData: FormData;
@@ -176,7 +194,10 @@ export async function POST(request: Request) {
   try {
     await ensureCollection();
   } catch {
-    return jsonError("Could not connect to Qdrant. Start the vector database and try again.", 503);
+    return jsonError(
+      "Could not prepare the Qdrant collection. Check Qdrant, and use Reset index after changing embedding modes or dimensions.",
+      503,
+    );
   }
 
   try {
@@ -186,10 +207,16 @@ export async function POST(request: Request) {
     embeddingTokens = embeddingResult.promptTokens;
     embeddingMs = Date.now() - embeddingStartedAt;
   } catch {
-    return jsonError("Could not create embeddings. Check OPENAI_API_KEY and try again.", 502);
+    return jsonError(
+      getRagMode() === "offline"
+        ? "Could not create local embeddings. Check Ollama and the configured embedding model."
+        : "Could not create embeddings. Check OPENAI_API_KEY and try again.",
+      502,
+    );
   }
-  const embeddingCostUsd =
-    (embeddingTokens / 1_000_000) * EMBEDDING_USD_PER_MILLION_TOKENS;
+  const embeddingCostUsd = getRagMode() === "offline"
+    ? 0
+    : (embeddingTokens / 1_000_000) * EMBEDDING_USD_PER_MILLION_TOKENS;
 
   const client = getQdrantClient();
   const collectionName = getCollectionName();
@@ -199,6 +226,7 @@ export async function POST(request: Request) {
     payload: {
       documentId,
       name: file.name.slice(0, 255),
+      chunkId: createChunkId(file.name.slice(0, 255), chunk.index, chunk.text),
       bytes: file.size,
       characters: text.trim().length,
       embeddingTokens,

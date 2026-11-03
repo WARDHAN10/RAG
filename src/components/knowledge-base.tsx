@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent, DragEvent, ReactNode } from "react";
+import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
 import type { StoredDocument, VectorHealth } from "@/lib/document-types";
+import type { RagResponse } from "@/lib/rag-core";
 
 
 type VectorMapPoint = {
@@ -12,6 +13,13 @@ type VectorMapPoint = {
   chunkIndex: number;
   x: number;
   y: number;
+};
+
+type UploadProgress = {
+  completedFiles: number;
+  totalFiles: number;
+  indexedFiles: number;
+  currentFile: string;
 };
 
 type IconName =
@@ -94,6 +102,37 @@ function Icon({
   );
 }
 
+function formatMaybeDuration(milliseconds: number | null) {
+  return milliseconds === null ? "—" : formatDuration(milliseconds);
+}
+
+function formatTokenCount(tokens: number | null) {
+  return tokens === null ? "Not reported" : tokens.toLocaleString();
+}
+
+function formatTokenPair(inputTokens: number | null, outputTokens: number | null) {
+  if (inputTokens === null && outputTokens === null) return "Not reported";
+  return `${inputTokens === null ? "—" : inputTokens.toLocaleString()} in / ${outputTokens === null ? "—" : outputTokens.toLocaleString()} out`;
+}
+
+function renderAnswerWithCitations(answer: string) {
+  return answer.split(/(\[S\d+\])/g).map((part, index) => {
+    const citation = part.match(/^\[(S\d+)\]$/)?.[1];
+    return citation ? (
+      <a key={index} href={"#source-" + citation} className="font-semibold text-[#167d62] underline decoration-[#b8d8c7] underline-offset-2">{part}</a>
+    ) : <span key={index}>{part}</span>;
+  });
+}
+
+function MetricLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-[#f0f2f0] pb-1.5">
+      <dt className="text-[#87938c]">{label}</dt>
+      <dd className="text-right font-medium text-[#526058]">{value}</dd>
+    </div>
+  );
+}
+
 function vectorColor(documentId: string) {
   const colors = ["#168067", "#5a79c7", "#cf8550", "#8767b3", "#3f9aa1", "#bc617b", "#819743", "#bd9a3e"];
   let hash = 0;
@@ -112,9 +151,7 @@ function formatCost(amount: number) {
 }
 
 function formatDuration(milliseconds: number) {
-  return milliseconds < 1000
-    ? String(Math.round(milliseconds)) + " ms"
-    : (milliseconds / 1000).toFixed(1) + " s";
+  return milliseconds.toFixed(1) + " ms";
 }
 
 function formatSize(bytes: number) {
@@ -129,11 +166,19 @@ export default function KnowledgeBase() {
   const [health, setHealth] = useState<VectorHealth | null>(null);
   const [connectionState, setConnectionState] = useState<"checking" | "connected" | "setup" | "offline">("checking");
   const [isUploading, setIsUploading] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+  const [isRemovingDocument, setIsRemovingDocument] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [notice, setNotice] = useState("");
   const [noticeIsError, setNoticeIsError] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [vectorMapPoints, setVectorMapPoints] = useState<VectorMapPoint[]>([]);
+  const [question, setQuestion] = useState("");
+  const [topK, setTopK] = useState(5);
+  const [askResult, setAskResult] = useState<RagResponse | null>(null);
+  const [askError, setAskError] = useState("");
+  const [isAsking, setIsAsking] = useState(false);
   const [vectorMapState, setVectorMapState] = useState<"loading" | "ready" | "unavailable">("loading");
 
   const chunkCount = documents.reduce((total, document) => total + document.chunkCount, 0);
@@ -143,24 +188,26 @@ export default function KnowledgeBase() {
   const averageEmbeddingMs = trackedDocuments.length
     ? trackedDocuments.reduce((total, document) => total + (document.embeddingMs ?? 0), 0) / trackedDocuments.length
     : null;
-  const canUpload = Boolean(health?.ready && connectionState === "connected" && !isUploading);
+  const canUpload = Boolean(health?.ready && connectionState === "connected" && !isUploading && !isResetting);
   const vectorStoreValue =
     connectionState === "checking"
       ? "Checking..."
       : connectionState === "connected"
-        ? "Connected"
+        ? health?.ragMode === "offline" ? "Offline ready" : "Online ready"
         : connectionState === "offline"
           ? "Offline"
           : health?.qdrantConnected
-            ? "Add API key"
+            ? "Provider setup"
             : "Setup needed";
   const vectorStoreDetail =
     connectionState === "connected"
-      ? "Qdrant connected · OpenAI key set"
+      ? `Qdrant connected · ${health?.providerName} · ${health?.answerModel}`
       : connectionState === "offline"
         ? "Start Qdrant and retry"
-        : health?.qdrantConfigured && !health.embeddingConfigured
-          ? "Set OPENAI_API_KEY"
+        : health?.qdrantConnected
+          ? !health.embeddingConfigured
+            ? health.providerMessage ?? "Check the selected model provider."
+            : health.indexMessage ?? "Check the selected model provider."
           : "Configure .env.local";
 
   async function refreshVectorMap() {
@@ -176,6 +223,33 @@ export default function KnowledgeBase() {
     }
   }
 
+  async function handleAsk(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (isResetting) return;
+    const nextQuestion = question.trim();
+    if (!nextQuestion) return;
+
+    setAskError("");
+    setAskResult(null);
+    setIsAsking(true);
+    try {
+      const response = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: nextQuestion, topK }),
+      });
+      const payload = (await response.json()) as RagResponse | { error?: string };
+      if (!response.ok || !("status" in payload)) {
+        throw new Error("error" in payload ? payload.error || "Could not answer this question." : "Could not answer this question.");
+      }
+      setAskResult(payload);
+    } catch (error) {
+      setAskError(error instanceof Error ? error.message : "Could not answer this question.");
+    } finally {
+      setIsAsking(false);
+    }
+  }
+
   useEffect(() => {
     let active = true;
 
@@ -188,8 +262,8 @@ export default function KnowledgeBase() {
 
         setHealth(nextHealth);
         if (nextHealth.ready) setConnectionState("connected");
-        else if (nextHealth.qdrantConfigured && nextHealth.embeddingConfigured) setConnectionState("offline");
-        else setConnectionState("setup");
+        else if (!nextHealth.qdrantConfigured || nextHealth.qdrantConnected) setConnectionState("setup");
+        else setConnectionState("offline");
 
         if (nextHealth.qdrantConnected) {
           const documentsResponse = await fetch("/api/documents", { cache: "no-store" });
@@ -215,11 +289,13 @@ export default function KnowledgeBase() {
   }, []);
 
   async function addFiles(files: File[]) {
+    if (isUploading || isResetting || files.length === 0) return;
+
     setNotice("");
     setNoticeIsError(false);
 
     if (!health?.ready) {
-      setNotice("Configure Qdrant and OPENAI_API_KEY before uploading documents.");
+      setNotice(health?.providerMessage ?? health?.indexMessage ?? "Configure Qdrant and the selected model provider before uploading documents.");
       setNoticeIsError(true);
       return;
     }
@@ -227,14 +303,41 @@ export default function KnowledgeBase() {
     setIsUploading(true);
     const accepted: StoredDocument[] = [];
     const rejected: string[] = [];
+    let completedFiles = 0;
+    setUploadProgress({
+      completedFiles,
+      totalFiles: files.length,
+      indexedFiles: 0,
+      currentFile: files[0].name,
+    });
 
-    for (const file of files) {
+    for (const [index, file] of files.entries()) {
+      setUploadProgress({
+        completedFiles,
+        totalFiles: files.length,
+        indexedFiles: accepted.length,
+        currentFile: file.name,
+      });
       if (!/\.(txt|doc|pdf)$/i.test(file.name)) {
         rejected.push(file.name + ": only .txt, .doc, and .pdf files are supported.");
+        completedFiles += 1;
+        setUploadProgress({
+          completedFiles,
+          totalFiles: files.length,
+          indexedFiles: accepted.length,
+          currentFile: files[index + 1]?.name ?? "",
+        });
         continue;
       }
       if (file.size > 2 * 1024 * 1024) {
         rejected.push(file.name + ": files must be 2 MB or smaller.");
+        completedFiles += 1;
+        setUploadProgress({
+          completedFiles,
+          totalFiles: files.length,
+          indexedFiles: accepted.length,
+          currentFile: files[index + 1]?.name ?? "",
+        });
         continue;
       }
 
@@ -259,6 +362,13 @@ export default function KnowledgeBase() {
           file.name + ": " + (error instanceof Error ? error.message : "upload failed."),
         );
       }
+      completedFiles += 1;
+      setUploadProgress({
+        completedFiles,
+        totalFiles: files.length,
+        indexedFiles: accepted.length,
+        currentFile: files[index + 1]?.name ?? "",
+      });
     }
 
     if (accepted.length > 0) {
@@ -279,6 +389,7 @@ export default function KnowledgeBase() {
       );
     }
     setIsUploading(false);
+    setUploadProgress(null);
   }
 
   async function handleInputChange(event: ChangeEvent<HTMLInputElement>) {
@@ -293,7 +404,9 @@ export default function KnowledgeBase() {
   }
 
   async function removeDocument(id: string) {
+    if (isUploading || isResetting || isAsking || isRemovingDocument) return;
     setNotice("");
+    setIsRemovingDocument(true);
     try {
       const response = await fetch("/api/documents/" + encodeURIComponent(id), {
         method: "DELETE",
@@ -309,6 +422,57 @@ export default function KnowledgeBase() {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Could not remove this document.");
       setNoticeIsError(true);
+    } finally {
+      setIsRemovingDocument(false);
+    }
+  }
+
+  async function resetIndex() {
+    if (isUploading || isResetting || isAsking || isRemovingDocument) return;
+    const confirmed = window.confirm(
+      "Clear every indexed document, chunk, and vector in the configured Qdrant collection? The collection will be recreated for the current embedding dimensions. Original files are not stored, so upload them again to re-index.",
+    );
+    if (!confirmed) return;
+
+    setIsResetting(true);
+    setNotice("");
+    setNoticeIsError(false);
+    try {
+      const response = await fetch("/api/documents", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      });
+      const result = (await response.json()) as { reset?: boolean; error?: string };
+      if (!response.ok || !result.reset) {
+        throw new Error(result.error || "Could not reset the document index.");
+      }
+
+      setDocuments([]);
+      setVectorMapPoints([]);
+      setVectorMapState("ready");
+      setHealth((current) => current ? {
+        ...current,
+        indexedVectorSize: current.vectorSize,
+        vectorDimensionsMatch: current.vectorSize === null ? null : true,
+        indexMessage: null,
+        ready: current.qdrantConnected && current.embeddingConfigured && current.vectorSize !== null,
+      } : current);
+      setConnectionState(
+        health?.qdrantConnected
+          ? health.embeddingConfigured && health.vectorSize !== null ? "connected" : "setup"
+          : "offline",
+      );
+      setExpandedId(null);
+      setAskResult(null);
+      setAskError("");
+      setQuestion("");
+      setNotice("Index cleared. Upload the files again to re-index them.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not reset the document index.");
+      setNoticeIsError(true);
+    } finally {
+      setIsResetting(false);
     }
   }
 
@@ -341,11 +505,11 @@ export default function KnowledgeBase() {
             Sources
             <span className="ml-auto h-1.5 w-1.5 rounded-full bg-[#299b77]" />
           </div>
-          <div className="flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] text-[#8a9690]">
+          <a href="#ask" className="flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] text-[#526058] transition hover:bg-[#f5f8f6]">
             <Icon name="search" className="h-[17px] w-[17px]" />
-            Search
-            <span className="ml-auto text-[9px] font-medium text-[#aab3ae]">SOON</span>
-          </div>
+            Ask documents
+            <span className="ml-auto text-[9px] font-medium text-[#43836c]">RAG</span>
+          </a>
           <div className="flex items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] text-[#8a9690]">
             <Icon name="database" className="h-[17px] w-[17px]" />
             Connections
@@ -378,7 +542,7 @@ export default function KnowledgeBase() {
             <span className="text-[#25342d]">Sources</span>
           </div>
           <div className="flex items-center gap-3">
-            <span className="hidden rounded-md border border-[#e8ece9] bg-[#fafcfb] px-2.5 py-1.5 text-[10px] font-medium text-[#748078] sm:inline-flex">{connectionState === "checking" ? "Checking database" : connectionState === "connected" ? "Qdrant connected" : connectionState === "offline" ? "Qdrant offline" : "Setup required"}</span>
+            <span className="hidden rounded-md border border-[#e8ece9] bg-[#fafcfb] px-2.5 py-1.5 text-[10px] font-medium text-[#748078] sm:inline-flex">{connectionState === "checking" ? "Checking services" : health?.modeConfigured ? `${health.ragMode.toUpperCase()} · ${health.providerName}` : "Choose online/offline mode"}</span>
             <span className="grid h-8 w-8 place-items-center rounded-full bg-[#e4f0ea] text-[11px] font-semibold text-[#316a54]">Q</span>
           </div>
         </header>
@@ -403,7 +567,9 @@ export default function KnowledgeBase() {
               className="inline-flex h-10 items-center gap-2 rounded-lg bg-[#167d62] px-4 text-xs font-semibold text-white shadow-sm transition hover:bg-[#0e664f] disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Icon name="plus" className="h-4 w-4" />
-              {isUploading ? "Saving to Qdrant..." : "Add documents"}
+              {isUploading && uploadProgress
+                ? `Indexing ${Math.min(uploadProgress.completedFiles + 1, uploadProgress.totalFiles)}/${uploadProgress.totalFiles}`
+                : "Add documents"}
             </button>
           </div>
 
@@ -411,11 +577,133 @@ export default function KnowledgeBase() {
             <StatCard label="Documents" value={String(documents.length).padStart(2, "0")} detail="TXT · DOC · PDF" icon="file" />
             <StatCard label="Text chunks" value={String(chunkCount).padStart(2, "0")} detail="Stored in Qdrant" icon="layers" />
             <StatCard label="Embedding tokens" value={trackedDocuments.length ? embeddingTokens.toLocaleString() : "—"} detail={trackedDocuments.length ? String(trackedDocuments.length) + " documents tracked" : "Tracked on new uploads"} icon="layers" />
-            <StatCard label="Embedding spend" value={trackedDocuments.length ? formatCost(embeddingCostUsd) : "—"} detail="Est. · $0.02 / 1M tokens" icon="database" />
-            <StatCard label="Avg. embed time" value={averageEmbeddingMs === null ? "—" : formatDuration(averageEmbeddingMs)} detail="Embedding API time · not search" icon="search" />
+            <StatCard label="Embedding spend" value={trackedDocuments.length ? formatCost(embeddingCostUsd) : "—"} detail={health?.ragMode === "offline" ? "Local mode · no API charge" : "OpenAI est. · $0.02 / 1M tokens"} icon="database" />
+            <StatCard label="Avg. embed time" value={averageEmbeddingMs === null ? "—" : formatDuration(averageEmbeddingMs)} detail={health?.ragMode === "offline" ? "Local model time · not search" : "OpenAI API time · not search"} icon="search" />
             <StatCard label="Vector store" value={vectorStoreValue} detail={vectorStoreDetail} icon="database" muted={connectionState !== "connected"} />
           </div>
-          <p className="-mt-3 mb-6 text-[10px] leading-5 text-[#87938c]">Spend covers successfully indexed embeddings at $0.02 per 1M tokens. Older uploads have no usage history; failed uploads, storage, tax, and answer generation are excluded.</p>
+          <p className="-mt-3 mb-6 text-[10px] leading-5 text-[#87938c]">Offline embeddings record $0 API spend; local compute and electricity are not priced. Online estimates use $0.02 per 1M tokens. Only recorded indexed uploads are included.</p>
+
+          <section id="ask" className="mb-5 scroll-mt-5 rounded-2xl border border-[#dce9e1] bg-white p-5 shadow-[0_2px_10px_rgba(26,45,35,0.025)] sm:p-6">
+            <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-[#25342d]">Ask your documents</h2>
+                <p className="mt-1 text-[11px] text-[#87938c]">Answers use retrieved passages and show the sources behind them.</p>
+              </div>
+              <span className="rounded-md bg-[#eaf5f0] px-2 py-1 text-[10px] font-medium text-[#34785f]">{health?.modeConfigured ? `${health.ragMode.toUpperCase()} · ${health.providerName.toUpperCase()}` : "CHOOSE ONLINE / OFFLINE"}</span>
+            </div>
+
+            {documents.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-[#dce5df] bg-[#fbfcfb] px-4 py-5 text-xs text-[#87938c]">
+                Upload and index a document first. Then you can ask questions about its contents.
+              </div>
+            ) : (
+              <form onSubmit={handleAsk}>
+                <label htmlFor="rag-question" className="mb-2 block text-[11px] font-medium text-[#526058]">Your question</label>
+                <textarea
+                  id="rag-question"
+                  value={question}
+                  onChange={(event) => setQuestion(event.target.value)}
+                  maxLength={2000}
+                  rows={3}
+                  placeholder="Ask something you expect your documents to answer…"
+                  className="w-full resize-y rounded-xl border border-[#dfe7e2] bg-[#fcfdfc] px-3.5 py-3 text-[13px] leading-5 text-[#25342d] outline-none transition placeholder:text-[#a0aaa4] focus:border-[#73ad94] focus:ring-2 focus:ring-[#e2f2e9]"
+                  disabled={!health?.ready || isAsking}
+                />
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                  <label className="flex items-center gap-2 text-[10px] text-[#849088]" htmlFor="rag-top-k">
+                    Chunks to retrieve
+                    <select id="rag-top-k" value={topK} onChange={(event) => setTopK(Number(event.target.value))} disabled={isAsking} className="rounded-md border border-[#e1e8e3] bg-white px-2 py-1.5 text-[11px] text-[#526058]">
+                      {[3, 5, 8].map((value) => <option key={value} value={value}>{value}</option>)}
+                    </select>
+                  </label>
+                  <button type="submit" disabled={!health?.ready || !question.trim() || isAsking || isResetting} className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#167d62] px-4 text-xs font-semibold text-white transition hover:bg-[#0e664f] disabled:cursor-not-allowed disabled:opacity-50">
+                    <Icon name="search" className="h-3.5 w-3.5" />
+                    {isAsking ? "Searching documents…" : "Ask question"}
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {askError && <p role="alert" className="mt-3 rounded-lg bg-[#fff3f1] px-3 py-2.5 text-xs text-[#a44b45]">{askError}</p>}
+
+            {askResult && (
+              <div className="mt-5 border-t border-[#edf0ee] pt-5">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] font-semibold text-[#34443b]">{askResult.status === "answered" ? "Answer" : askResult.status === "insufficient-evidence" ? "Not enough evidence" : askResult.status === "empty" ? "No documents indexed" : "No passages found"}</span>
+                  {askResult.abstained && <span className="rounded-md bg-[#fff8ea] px-2 py-1 text-[9px] font-medium text-[#8a7041]">ABSTAINED</span>}
+                </div>
+                <p className="whitespace-pre-wrap text-[13px] leading-6 text-[#34443b]">{renderAnswerWithCitations(askResult.answer)}</p>
+
+                <div aria-label="Question performance" className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  <div className="rounded-lg border border-[#e8ece9] bg-[#fbfcfb] px-3 py-2.5">
+                    <p className="text-[9px] font-medium text-[#87938c]">Query embedding</p>
+                    <p className="mt-1 text-sm font-semibold text-[#25342d]">{formatMaybeDuration(askResult.metrics.queryEmbeddingMs)}</p>
+                  </div>
+                  <div className="rounded-lg border border-[#e8ece9] bg-[#fbfcfb] px-3 py-2.5">
+                    <p className="text-[9px] font-medium text-[#87938c]">Qdrant retrieval</p>
+                    <p className="mt-1 text-sm font-semibold text-[#25342d]">{formatMaybeDuration(askResult.metrics.vectorRetrievalMs)}</p>
+                  </div>
+                  <div className="rounded-lg border border-[#e8ece9] bg-[#fbfcfb] px-3 py-2.5">
+                    <p className="text-[9px] font-medium text-[#87938c]">Total retrieval</p>
+                    <p className="mt-1 text-sm font-semibold text-[#25342d]">{formatMaybeDuration(askResult.metrics.totalRetrievalMs)}</p>
+                  </div>
+                  <div className="rounded-lg border border-[#e8ece9] bg-[#fbfcfb] px-3 py-2.5">
+                    <p className="text-[9px] font-medium text-[#87938c]">Answer generation</p>
+                    <p className="mt-1 text-sm font-semibold text-[#25342d]">{formatMaybeDuration(askResult.metrics.answerGenerationMs)}</p>
+                  </div>
+                  <div className="rounded-lg border border-[#e8ece9] bg-[#fbfcfb] px-3 py-2.5">
+                    <p className="text-[9px] font-medium text-[#87938c]">End-to-end request</p>
+                    <p className="mt-1 text-sm font-semibold text-[#25342d]">{formatDuration(askResult.metrics.totalMs)}</p>
+                  </div>
+                  <div className="rounded-lg border border-[#e8ece9] bg-[#fbfcfb] px-3 py-2.5">
+                    <p className="text-[9px] font-medium text-[#87938c]">Evidence chunks</p>
+                    <p className="mt-1 text-sm font-semibold text-[#25342d]">{askResult.metrics.chunksRetrieved}</p>
+                  </div>
+                </div>
+
+                {askResult.sources.length > 0 && (
+                  <div className="mt-5">
+                    <h3 className="mb-2 text-[11px] font-semibold text-[#526058]">Retrieved sources</h3>
+                    <div className="space-y-2.5">
+                      {askResult.sources.map((source) => (
+                        <article id={"source-" + source.citationId} key={source.pointId} className="scroll-mt-5 rounded-xl border border-[#e8ece9] bg-[#fbfcfb] p-3.5">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-[#78857d]">
+                            <span className="font-semibold text-[#34785f]">[{source.citationId}]</span>
+                            <span className="font-medium text-[#526058]">{source.documentName}</span>
+                            <span>Chunk {source.chunkIndex ?? "unknown"}</span>
+                            <span>Rank {source.rank}</span>
+                            <span>Cosine score {source.score === null ? "unavailable" : source.score.toFixed(3)}</span>
+                          </div>
+                          <p className="mt-1 break-all font-mono text-[9px] text-[#8b9790]">Chunk ID: {source.chunkId}</p>
+                          <p className="mt-2 whitespace-pre-wrap text-[11px] leading-5 text-[#68766e]">{source.text}</p>
+                        </article>
+                      ))}
+                    </div>
+                    <p className="mt-2 text-[10px] text-[#9aa49e]">Cosine scores are similarity rankings, not calibrated probabilities.</p>
+                  </div>
+                )}
+
+                <details className="mt-4 rounded-xl border border-[#edf0ee] bg-white px-3.5 py-3">
+                  <summary className="cursor-pointer text-[10px] font-semibold text-[#718078]">Query details and cost estimate</summary>
+                  <dl className="mt-3 grid gap-x-6 gap-y-2 text-[10px] sm:grid-cols-2 lg:grid-cols-3">
+                    <MetricLine label="Qdrant collection check" value={formatMaybeDuration(askResult.metrics.collectionCheckMs)} />
+                    <MetricLine label="Query embedding" value={formatMaybeDuration(askResult.metrics.queryEmbeddingMs)} />
+                    <MetricLine label="Qdrant vector retrieval" value={formatMaybeDuration(askResult.metrics.vectorRetrievalMs)} />
+                    <MetricLine label="Total retrieval (embedding + Qdrant)" value={formatMaybeDuration(askResult.metrics.totalRetrievalMs)} />
+                    <MetricLine label="Answer generation" value={formatMaybeDuration(askResult.metrics.answerGenerationMs)} />
+                    <MetricLine label="End-to-end server request" value={formatDuration(askResult.metrics.totalMs)} />
+                    <MetricLine label="Chunks retrieved" value={String(askResult.metrics.chunksRetrieved)} />
+                    <MetricLine label="Query embedding tokens" value={formatTokenCount(askResult.metrics.queryEmbeddingTokens)} />
+                    <MetricLine label="Answer input / output tokens" value={formatTokenPair(askResult.metrics.answerInputTokens, askResult.metrics.answerOutputTokens)} />
+                    <MetricLine label="Cached answer input tokens" value={formatTokenCount(askResult.metrics.answerCachedInputTokens)} />
+                    <MetricLine label="Answer model" value={askResult.metrics.answerModel ?? "Not called"} />
+                    <MetricLine label="Estimated query cost" value={askResult.metrics.estimatedQueryCostUsd === null ? "Unavailable" : formatCost(askResult.metrics.estimatedQueryCostUsd)} />
+                  </dl>
+                  <p className="mt-3 text-[10px] leading-4 text-[#9aa49e]">Total retrieval is query embedding plus Qdrant search; collection check is shown separately. End-to-end server request time excludes browser and network display time. Query cost is separate from indexing spend, uses configured model pricing, and excludes hosting and tax.</p>
+                </details>
+              </div>
+            )}
+          </section>
 
           <section className="mb-5 rounded-2xl border border-[#e6ebe7] bg-white p-5 shadow-[0_2px_10px_rgba(26,45,35,0.025)] sm:p-6">
             <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
@@ -454,11 +742,13 @@ export default function KnowledgeBase() {
 
           {connectionState !== "checking" && connectionState !== "connected" && (
             <div className="mb-5 rounded-xl border border-[#eadfc6] bg-[#fffaf0] px-4 py-3.5">
-              <p className="text-xs font-semibold text-[#695a3f]">Finish the database setup to upload</p>
+              <p className="text-xs font-semibold text-[#695a3f]">{health?.qdrantConnected ? "Finish model or index setup to upload" : "Finish the database setup to upload"}</p>
               <p className="mt-1 text-[11px] leading-5 text-[#887a5f]">
                 {connectionState === "offline"
                   ? "Qdrant is configured but unreachable. Run docker compose up -d and check QDRANT_URL."
-                  : "Copy .env.example to .env.local, add OPENAI_API_KEY, run docker compose up -d, then restart QuizNest."}
+                  : health?.qdrantConnected
+                    ? health.providerMessage ?? health.indexMessage ?? "Check the selected provider settings in .env.local."
+                    : "Copy .env.example to .env.local, choose RAG_MODE, run docker compose up -d, then start QuizNest."}
               </p>
             </div>
           )}
@@ -508,10 +798,46 @@ export default function KnowledgeBase() {
                   disabled={!canUpload}
                   className="mt-4 rounded-lg border border-[#dfe6e1] bg-white px-3.5 py-2 text-[11px] font-semibold text-[#415249] shadow-[0_1px_2px_rgba(20,40,29,0.03)] transition hover:border-[#b8c9bf] hover:bg-[#fbfdfb] disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {isUploading ? "Saving..." : "Browse files"}
+                  {isUploading && uploadProgress
+                    ? `Indexing ${Math.min(uploadProgress.completedFiles + 1, uploadProgress.totalFiles)}/${uploadProgress.totalFiles}`
+                    : "Browse files"}
                 </button>
                 <p className="mt-3 text-[10px] text-[#a0aaa4]">Up to 2 MB · Scanned PDFs need OCR</p>
               </div>
+
+              {uploadProgress && (
+                <div role="status" aria-live="polite" className="mt-4 rounded-xl border border-[#dce9e1] bg-[#f7fbf8] px-3.5 py-3">
+                  <div className="flex items-center justify-between gap-3 text-[10px]">
+                    <span className="font-semibold text-[#415249]">
+                      {uploadProgress.completedFiles} of {uploadProgress.totalFiles} files processed
+                    </span>
+                    <span className="text-[#718078]">{uploadProgress.indexedFiles} indexed</span>
+                  </div>
+                  <div
+                    role="progressbar"
+                    aria-label="File indexing progress"
+                    aria-valuemin={0}
+                    aria-valuemax={uploadProgress.totalFiles}
+                    aria-valuenow={uploadProgress.completedFiles}
+                    className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#e5eee8]"
+                  >
+                    <div
+                      className="h-full rounded-full bg-[#299b77] transition-[width] duration-300"
+                      style={{ width: `${(uploadProgress.completedFiles / uploadProgress.totalFiles) * 100}%` }}
+                    />
+                  </div>
+                  <p className="mt-2 flex items-center gap-2 text-[10px] text-[#718078]">
+                    {uploadProgress.currentFile ? (
+                      <>
+                        <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-[#d8e7de] border-t-[#167d62]" />
+                        <span className="truncate">Indexing {uploadProgress.currentFile}</span>
+                      </>
+                    ) : (
+                      "Finishing up…"
+                    )}
+                  </p>
+                </div>
+              )}
 
               {notice && (
                 <p role="status" className={"mt-3 text-xs " + (noticeIsError ? "text-[#a44b45]" : "text-[#24775c]")}>
@@ -531,10 +857,10 @@ export default function KnowledgeBase() {
                 </div>
               </div>
               <FlowStep number="01" title="Upload a document" description="The file is sent to the QuizNest server for indexing." state={documents.length ? "complete" : "active"} />
-              <FlowStep number="02" title="Chunk and embed" description="OpenAI creates a 1536-dimension vector for each chunk." state={documents.length ? "complete" : health?.embeddingConfigured ? "active" : "pending"} />
+              <FlowStep number="02" title="Chunk and embed" description={health ? `${health.providerName} · ${health.embeddingModel} · ${health.vectorSize ?? "?"} dimensions` : "The selected provider creates vectors for each chunk."} state={documents.length ? "complete" : health?.embeddingConfigured ? "active" : "pending"} />
               <FlowStep number="03" title="Store in Qdrant" description="Chunks, vectors, and document details persist in your collection." state={documents.length ? "complete" : health?.qdrantConnected ? "active" : "pending"} last />
               <div className="mt-4 rounded-lg bg-[#f7f9f7] px-3 py-2.5 text-[10px] leading-[1.55] text-[#829087]">
-                Text is sent to OpenAI for embeddings. The original file is not retained separately.
+                {health?.ragMode === "offline" ? "Text is processed by local Ollama models. The original file is not retained separately." : "Text is sent to OpenAI for embeddings. The original file is not retained separately."}
               </div>
             </section>
           </div>
@@ -547,8 +873,20 @@ export default function KnowledgeBase() {
                   {documents.length ? String(documents.length) + " " + (documents.length === 1 ? "document" : "documents") + " indexed in Qdrant" : "Files you add will appear here"}
                 </p>
               </div>
-              {documents.length > 0 && (
-                <span className="rounded-md bg-[#eaf5f0] px-2 py-1 text-[10px] font-medium text-[#34785f]">Persisted</span>
+              {(documents.length > 0 || health?.qdrantConnected) && (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={resetIndex}
+                    disabled={isResetting || isUploading || isAsking || isRemovingDocument}
+                    className="rounded-md border border-[#ead8d5] px-2.5 py-1.5 text-[10px] font-medium text-[#a44b45] transition hover:bg-[#fff5f3] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isResetting ? "Resetting index…" : "Reset index"}
+                  </button>
+                  {documents.length > 0 && (
+                    <span className="rounded-md bg-[#eaf5f0] px-2 py-1 text-[10px] font-medium text-[#34785f]">Persisted</span>
+                  )}
+                </div>
               )}
             </div>
 
@@ -589,6 +927,7 @@ export default function KnowledgeBase() {
                         <button
                           type="button"
                           onClick={() => void removeDocument(document.id)}
+                          disabled={isRemovingDocument || isResetting || isUploading || isAsking}
                           className="grid h-8 w-8 place-items-center rounded-lg text-[#a2aca6] transition hover:bg-[#fff4f2] hover:text-[#b34d45]"
                           aria-label={"Remove " + document.name}
                         >
@@ -619,7 +958,7 @@ export default function KnowledgeBase() {
           </section>
 
           <p className="mt-5 text-center text-[10px] text-[#a2aca6]">
-            Text is sent to OpenAI for embeddings · <span className="font-medium text-[#718078]">chunks and vectors live in Qdrant</span>
+            {health?.ragMode === "offline" ? "Local Ollama inference · no model API calls" : "Online OpenAI inference"} · <span className="font-medium text-[#718078]">chunks and vectors live in Qdrant</span>
           </p>
         </main>
       </div>

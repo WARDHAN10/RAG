@@ -1,0 +1,3 @@
+QuizNest evaluation sample technical runbook. This is synthetic fixture data, not a real production runbook.
+
+QN-1842 is the incident tracking code for a customer-facing service outage. Create a P1 incident record using QN-1842. The incident template requires the service name, start time, affected users, and mitigation.

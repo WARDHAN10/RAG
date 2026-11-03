@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "description": "Synthetic starter set with manually assigned relevant chunk IDs. The live evaluation expects exactly the two bundled TXT files in the active collection.",
+  "requiredDocuments": ["sample-employee-guide.txt", "sample-technical-runbook.txt"],
+  "topK": 5,
+  "cases": [
+    {
+      "id": "single-document-policy",
+      "category": "single-document",
+      "question": "How many days per week does the sample guide allow remote work?",
+      "expectedFacts": ["The sample guide allows remote work three days per week."],
+      "relevantChunkIds": ["sample-employee-guide.txt#chunk-1-4cafe824ddb9"],
+      "shouldAbstain": false
+    },
+    {
+      "id": "multi-document-outage",
+      "category": "multi-document",
+      "question": "For a customer-facing outage, which incident code should I use and how soon should I notify the on-call manager?",
+      "expectedFacts": ["Use incident code QN-1842.", "Notify the on-call manager within 30 minutes of confirming the disruption."],
+      "relevantChunkIds": ["sample-employee-guide.txt#chunk-1-4cafe824ddb9", "sample-technical-runbook.txt#chunk-1-a3c0fb0b53b7"],
+      "shouldAbstain": false
+    },
+    {
+      "id": "paraphrased-policy",
+      "category": "paraphrased-question",
+      "question": "Once a user-visible service disruption is confirmed, how long can I wait before telling the on-call manager?",
+      "expectedFacts": ["Notify the on-call manager within 30 minutes of confirming the disruption."],
+      "relevantChunkIds": ["sample-employee-guide.txt#chunk-1-4cafe824ddb9"],
+      "shouldAbstain": false
+    },
+    {
+      "id": "exact-technical-term",
+      "category": "exact-technical-term",
+      "question": "What does QN-1842 identify in the runbook?",
+      "expectedFacts": ["QN-1842 is the incident tracking code for a customer-facing service outage."],
+      "relevantChunkIds": ["sample-technical-runbook.txt#chunk-1-a3c0fb0b53b7"],
+      "shouldAbstain": false
+    },
+    {
+      "id": "missing-answer",
+      "category": "answer-absent",
+      "question": "What is the annual hardware budget?",
+      "expectedFacts": [],
+      "relevantChunkIds": [],
+      "shouldAbstain": true
+    }
+  ]
+}
